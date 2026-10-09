@@ -1,0 +1,292 @@
+---
+title: "Equação do melhorista com os dados: tempo e seleção indireta na HTP"
+author: "Cristhian Milbradt Babeski, PPGA/UFSM"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 3.8, dpi = 110)
+library(readxl); library(lme4); library(ggplot2); library(openxlsx)
+tema <- theme_minimal(base_size = 13)
+
+arq    <- "banco_equacao_melhorista.xlsx"          # trocar pelo banco real (mesmas colunas)
+dados  <- read_excel(arq, sheet = "dados")
+custos <- read_excel(arq, sheet = "custos")        # aba com capacidade e ciclos (valores hipotéticos)
+p <- custos$valor                                  # 1 custo conv., 2 custo HTP, 3 parcelas/genótipo, 4 orçamento, 5 selecionados, 6 L conv., 7 L HTP
+n_sel <- p[5]; L_conv <- p[6]; L_htp <- p[7]
+N_conv <- floor(p[4] / (p[3] * p[1]))              # genótipos que o método convencional comporta
+N_htp  <- floor(p[4] / (p[3] * p[2]))              # genótipos que a HTP comporta
+
+i_sel <- function(n_sel, n_aval) dnorm(qnorm(1 - n_sel / n_aval)) / (n_sel / n_aval)   # intensidade de seleção
+comp <- function(d, y) {                            # H² na média, CV genotípico (CVg) e CV do erro (CVe), em %
+  d$ano <- factor(d$ano); d$bloco <- factor(d$bloco)
+  m <- lmer(as.formula(paste(y, "~ (1|genotipo) + (1|ano) + (1|genotipo:ano) + (1|ano:bloco)")), d)
+  v <- as.data.frame(VarCorr(m)); v <- setNames(v$vcov, v$grp)
+  e <- nlevels(d$ano); rep <- nlevels(d$bloco); mu <- mean(d[[y]])
+  c(H2 = unname(v["genotipo"] / (v["genotipo"] + v["genotipo:ano"] / e + v["Residual"] / (e * rep))),
+    CVg = unname(100 * sqrt(v["genotipo"]) / mu), CVe = unname(100 * sqrt(v["Residual"]) / mu))
+}
+ajusta <- function(d, y) {                          # H² na média de genótipos (modelo misto)
+  d$ano <- factor(d$ano); d$bloco <- factor(d$bloco)
+  m <- lmer(as.formula(paste(y, "~ (1|genotipo) + (1|ano) + (1|genotipo:ano) + (1|ano:bloco)")), d)
+  v <- as.data.frame(VarCorr(m)); v <- setNames(v$vcov, v$grp)
+  e <- nlevels(d$ano); rep <- nlevels(d$bloco)
+  unname(v["genotipo"] / (v["genotipo"] + v["genotipo:ano"] / e + v["Residual"] / (e * rep)))
+}
+```
+
+## 1 Equação
+
+$$\Delta G = \frac{i \cdot r \cdot \sigma_G}{L}$$
+
+| Termo | O que é | O que a HTP faz |
+|---|---|---|
+| **L** | anos por ciclo | encurta se a decisão com o índice substituir uma etapa |
+| **r** | acurácia do critério | seleção indireta: $r = H \cdot r_G$ |
+| **i** | intensidade de seleção | sobe se mais genótipos forem avaliados |
+| **σG** | variação genotípica | não muda |
+
+Aqui $H$ é a raiz da herdabilidade em sentido amplo ($H^2$) e $\sigma_G$ o desvio-padrão genotípico: sem pedigree não há herdabilidade restrita ($h^2$) nem $\sigma_A$, e para seleção entre linhagens a $H^2$ é a que governa a resposta. Seleção indireta pelo índice $x$ no lugar do rendimento $y$, com a mesma intensidade: $CR_y/R_y = (H_x/H_y) \cdot r_G$. Fontes: Lush (1937); Falconer e Mackay (1996); Cobb et al. (2019).
+
+## 2 Banco (simulado)
+
+`r length(unique(dados$genotipo))` genótipos, `r length(unique(dados$ano))` safras, `r length(unique(dados$bloco))` blocos, `r length(unique(dados$voo))` voos. R, G e B são as médias das bandas na parcela (0 a 255).
+
+```{r banco}
+head(dados)
+```
+
+## 3 Índice de imagem
+
+```{r indices}
+dados$NGRDI <- (dados$G - dados$R) / (dados$G + dados$R)
+dados$GLI   <- ((dados$G - dados$R) + (dados$G - dados$B)) / (dados$G + dados$R + dados$G + dados$B)
+dados$VARI  <- (dados$G - dados$R) / (dados$G + dados$R - dados$B)
+indice_usado <- "GLI"                     # trocar aqui muda o relatório inteiro
+dados$indice <- dados[[indice_usado]]
+```
+
+| Índice | Fórmula |
+|---|---|
+| NGRDI | (G − R) / (G + R) |
+| GLI | ((G − R) + (G − B)) / (G + R + G + B) |
+| VARI | (G − R) / (G + R − B) |
+
+Índice usado: **`r indice_usado`**.
+
+## 4 r do método convencional
+
+H² na média de genótipos por modelo misto; acurácia = raiz de H² (Cruz; Regazzi; Carneiro, 2012).
+
+```{r r_conv}
+parc <- unique(dados[c("genotipo", "ano", "bloco", "rendimento")])
+H2_conv <- ajusta(parc, "rendimento")
+r_conv  <- sqrt(H2_conv)
+c(H2 = H2_conv, r = r_conv)
+```
+
+## 5 r da HTP: seleção indireta
+
+$r = H \cdot r_G$, com $H$ a raiz da herdabilidade do índice e $r_G$ a correlação genotípica entre índice e rendimento (correlação das médias de genótipos corrigida pelas herdabilidades).
+
+```{r r_htp}
+r_htp <- function(k, ind = "indice") {
+  x  <- subset(dados, voo <= k)
+  d  <- aggregate(list(indice = x[[ind]]), x[c("genotipo", "ano", "bloco")], mean)   # média dos k voos por parcela
+  H2 <- ajusta(d, "indice")
+  rp <- cor(tapply(d$indice, d$genotipo, mean), tapply(parc$rendimento, parc$genotipo, mean))
+  rg <- min(rp / sqrt(H2 * H2_conv), 1)
+  c(H2_indice = H2, rg = rg, r = sqrt(H2) * rg)
+}
+htp <- rbind("1 voo" = r_htp(1), "todos os voos" = r_htp(max(dados$voo)))
+round(htp, 2)
+r_h <- htp["todos os voos", "r"]
+```
+
+Voos da mesma safra repetem o erro de parcela: o limite de r é a rg, não o número de voos.
+
+```{r comp_ind}
+round(t(sapply(c("NGRDI", "GLI", "VARI"), function(x) r_htp(max(dados$voo), x))), 2)   # comparação dos índices
+```
+
+```{r cry}
+CRy_Ry <- r_h / r_conv      # com a mesma intensidade de seleção e o mesmo ciclo
+round(c(r_conv = r_conv, r_htp = r_h, CRy_Ry = CRy_Ry), 2)
+```
+
+Selecionar pelo índice entrega **`r round(100 * CRy_Ry)`%** do ganho da seleção direta. Os `r 100 - round(100 * CRy_Ry)`% restantes têm de vir do ciclo (L) ou do número de genótipos (i).
+
+## 6 Voo a voo: herdabilidade, CV e acurácia
+
+Cada voo é analisado sozinho, com o mesmo modelo. **H²** é a herdabilidade do índice na média de genótipos, **CVg** o coeficiente de variação genotípico, **CVe** o do erro e **CVg/CVe** a razão entre eles (quanto maior, mais variação genética em relação ao ruído). A acurácia é $r = H \cdot r_G$.
+
+```{r voos}
+H2_y <- comp(parc, "rendimento")
+r_voo <- function(k) {
+  d  <- subset(dados, voo == k)[c("genotipo", "ano", "bloco", "indice")]
+  cc <- comp(d, "indice")
+  rp <- cor(tapply(d$indice, d$genotipo, mean), tapply(parc$rendimento, parc$genotipo, mean))
+  rg <- min(rp / sqrt(cc["H2"] * H2_y["H2"]), 1)
+  c(voo = k, H2 = unname(cc["H2"]), CVg = unname(cc["CVg"]), CVe = unname(cc["CVe"]),
+    CVg_CVe = unname(cc["CVg"] / cc["CVe"]), rg = unname(rg), r = unname(sqrt(cc["H2"]) * rg))
+}
+voos <- as.data.frame(t(sapply(sort(unique(dados$voo)), r_voo)))
+round(rbind(rendimento = c(voo = NA, H2 = H2_y[["H2"]], CVg = H2_y[["CVg"]], CVe = H2_y[["CVe"]], CVg_CVe = H2_y[["CVg"]] / H2_y[["CVe"]], rg = 1, r = sqrt(H2_y[["H2"]])), voos), 2)
+```
+
+```{r grafico_voos, fig.height = 3.4}
+ggplot(voos, aes(voo)) +
+  geom_line(aes(y = H2, colour = "H² do índice"), linewidth = 1) + geom_line(aes(y = rg, colour = "rG com o rendimento"), linewidth = 1) +
+  geom_line(aes(y = r, colour = "r = H · rG"), linewidth = 1.2) + geom_hline(yintercept = r_conv, linetype = 2) +
+  scale_x_continuous(breaks = voos$voo) + scale_colour_manual(values = c("#1b5e20", "#e65100", "#1565c0")) +
+  labs(x = "voo", y = NULL, colour = NULL, caption = "Tracejado: acurácia do rendimento (convencional)") + tema
+```
+
+Leitura: a H² do índice cai ao longo dos voos (`r round(voos$H2[1], 2)` no primeiro, `r round(voos$H2[nrow(voos)], 2)` no último), a rG varia de `r round(min(voos$rg), 2)` a `r round(max(voos$rg), 2)`, e o r fica numa faixa estreita (`r round(min(voos$r), 2)` a `r round(max(voos$r), 2)`). Diferenças desse tamanho entre voos não permitem ranqueá-los: escolher o melhor voo nos mesmos dados dá um r otimista, que precisa ser confirmado em outra safra. O CV do índice é alto porque a média dele é baixa (cerca de 0,18); serve para comparar voos entre si, não com o CV do rendimento.
+
+## 7 Tempo: quanto o ciclo precisa encurtar
+
+Com o mesmo i, ganho relativo da HTP = (r da HTP ÷ r convencional) ÷ (L da HTP ÷ L convencional).
+
+```{r tempo}
+Lrel  <- c(1, 0.9, 0.75, 0.5)     # ciclo da HTP em fração do convencional
+tempo <- data.frame(ciclo_HTP = Lrel, ganho_relativo_pct = round(100 * CRy_Ry / Lrel))
+tempo
+```
+
+Empate com o mesmo i: ciclo da HTP em **`r round(CRy_Ry, 2)`** do convencional, isto é, encurtamento mínimo de **`r round(100 * (1 - CRy_Ry))`%**.
+
+## 8 Genótipos: efeito sobre i
+
+Capacidade de cada método (aba `custos`, valores hipotéticos), com `r n_sel` genótipos selecionados.
+
+```{r i}
+data.frame(metodo = c("convencional", "HTP"), avaliados = c(N_conv, N_htp),
+           i = round(c(i_sel(n_sel, N_conv), i_sel(n_sel, N_htp)), 2))
+```
+
+## 9 Cenários
+
+Ganho relativo = (i × r / L) de cada cenário ÷ o do convencional, com σG igual.
+
+```{r ganho}
+g <- function(N, r, L) i_sel(n_sel, N) * r / L
+res <- data.frame(
+  cenario   = c("A. Convencional", "B. HTP: só seleção indireta", "C. HTP: indireta + ciclo mais curto",
+                "D. HTP: indireta + mais genótipos", "E. HTP: indireta + mais genótipos + ciclo mais curto"),
+  avaliados = c(N_conv, N_conv, N_conv, N_htp, N_htp),
+  r         = round(c(r_conv, r_h, r_h, r_h, r_h), 2),
+  L         = c(L_conv, L_conv, L_htp, L_conv, L_htp))
+res$i <- round(i_sel(n_sel, res$avaliados), 2)
+res$ganho_relativo_pct <- round(100 * mapply(g, res$avaliados, res$r, res$L) / g(N_conv, r_conv, L_conv))
+res[c("cenario", "avaliados", "i", "r", "L", "ganho_relativo_pct")]
+```
+
+```{r grafico, fig.height = 4.2}
+ggplot(res, aes(factor(cenario, levels = rev(cenario)), ganho_relativo_pct, fill = ganho_relativo_pct >= 100)) +
+  geom_col(width = 0.6, show.legend = FALSE) + geom_hline(yintercept = 100, linetype = 2) + coord_flip() +
+  scale_fill_manual(values = c("grey60", "#1b5e20")) +
+  labs(x = NULL, y = "ganho genético anual (convencional = 100)") + tema
+```
+
+Seleção indireta sozinha: `r res$ganho_relativo_pct[2]`%. Ciclo mais curto: `r res$ganho_relativo_pct[3]`%. Mais genótipos: `r res$ganho_relativo_pct[4]`%. Os dois juntos: `r res$ganho_relativo_pct[5]`%. O efeito de L é proporcional a 1/L; o de i tem retorno decrescente. Com mais genótipos e o mesmo ciclo, o r mínimo para empatar é `r round(r_conv * i_sel(n_sel, N_conv) / i_sel(n_sel, N_htp), 2)`.
+
+## 10 Sensibilidade: r e ciclo
+
+Ganho relativo com mais genótipos (N da HTP), por r e por ciclo. Acima da linha tracejada a HTP compensa.
+
+```{r variar}
+v <- expand.grid(r = seq(0.3, 0.9, 0.01), Lrel = Lrel)
+v$ganho <- 100 * mapply(function(r, Lr) g(N_htp, r, L_conv * Lr), v$r, v$Lrel) / g(N_conv, r_conv, L_conv)
+ggplot(v, aes(r, ganho, colour = factor(Lrel))) + geom_line(linewidth = 1) + geom_hline(yintercept = 100, linetype = 2) +
+  labs(x = "acurácia da HTP (r)", y = "ganho relativo (%)", colour = "ciclo da HTP\n(convencional = 1)") + tema
+```
+
+## 11 R², RMSE e MAE
+
+Medem o ajuste na parcela, não a ordem das linhagens nem o tempo ganho. Para seleção, reportar também H² do índice, rg com o rendimento, acurácia por linhagem, coincidência do grupo selecionado e ganho anual relativo ao convencional (Fritsche-Neto et al., 2025; Roberts et al., 2017).
+
+## 12 Produtividade predita pelo RGB como critério auxiliar
+
+Além do índice, o critério auxiliar pode ser o **rendimento predito** por um modelo treinado nas bandas R, G e B (3 bandas × 6 voos = 18 preditoras). Cada genótipo é predito por um modelo treinado em outros genótipos (8 partes com genótipos inteiros de fora), depois de tirar o efeito de safra. Em cada critério, H², rG e r = H · rG são calculados na escala de genótipo. **r_verdadeiro** usa o valor genético da simulação (só existe no banco simulado).
+
+```{r aux_dados}
+vd <- read_excel(arq, sheet = "verdade_simulada")
+w <- reshape(as.data.frame(dados)[c("genotipo", "ano", "bloco", "voo", "R", "G", "B")], idvar = c("genotipo", "ano", "bloco"), timevar = "voo", direction = "wide")
+w <- merge(w, as.data.frame(parc), by = c("genotipo", "ano", "bloco"))
+X <- as.matrix(w[grep("^(R|G|B)\\.", names(w))]); y <- w$rendimento
+X <- apply(X, 2, function(v) v - ave(v, w$ano)); y <- y - ave(y, w$ano)      # tira o efeito de safra
+set.seed(1); gen <- unique(w$genotipo); fold <- setNames(sample(rep(1:8, length.out = length(gen))), gen)[w$genotipo]
+mg <- tapply(parc$rendimento, parc$genotipo, mean)
+
+avalia <- function(d, nome) {          # d: genotipo, ano, bloco, x (critério por parcela)
+  hx <- ajusta(d, "x"); mx <- tapply(d$x, d$genotipo, mean)
+  rg <- min(cor(mx[names(mg)], mg) / sqrt(hx * H2_conv), 1)
+  data.frame(criterio = nome, H2 = hx, rG = rg, r = sqrt(hx) * rg, r_verdadeiro = cor(mx[vd$genotipo], vd$g_rendimento))
+}
+prever <- function(nome, fun, Xm = X) {
+  w$x <- NA_real_
+  for (k in 1:8) { tr <- fold != k; w$x[!tr] <- fun(Xm[tr, , drop = FALSE], y[tr], Xm[!tr, , drop = FALSE]) }
+  avalia(w[c("genotipo", "ano", "bloco", "x")], nome)
+}
+```
+
+```{r aux_modelos}
+ridge <- function(Xt, yt, Xn) { m <- glmnet::cv.glmnet(scale(Xt), yt, alpha = 0)
+  as.numeric(predict(m, scale(Xn, attr(scale(Xt), "scaled:center"), attr(scale(Xt), "scaled:scale")), s = "lambda.min")) }
+floresta <- function(Xt, yt, Xn) predict(ranger::ranger(x = as.data.frame(Xt), y = yt, num.trees = 300, seed = 1), as.data.frame(Xn))$predictions
+xgb <- function(Xt, yt, Xn) {
+  m <- xgboost::xgb.train(params = list(objective = "reg:squarederror", eta = 0.05, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8),
+                          data = xgboost::xgb.DMatrix(Xt, label = yt), nrounds = 200, verbose = 0)
+  predict(m, xgboost::xgb.DMatrix(Xn)) }
+X3 <- sapply(c("R", "G", "B"), function(b) rowMeans(X[, grep(paste0("^", b, "\\."), colnames(X))]))
+linear <- function(Xt, yt, Xn) predict(lm(yt ~ ., data = as.data.frame(Xt)), as.data.frame(Xn))
+
+med <- function(ind) aggregate(list(x = dados[[ind]]), dados[c("genotipo", "ano", "bloco")], mean)
+aux <- rbind(avalia(med("GLI"), "índice GLI (média dos voos)"),
+             avalia(med("VARI"), "índice VARI (média dos voos)"),
+             prever("ridge em R, G, B (18 preditoras)", ridge),
+             prever("floresta aleatória em R, G, B", floresta),
+             prever("regressão linear em R, G, B médios", linear, X3))
+if (requireNamespace("xgboost", quietly = TRUE)) aux <- rbind(aux, prever("XGBoost em R, G, B (18 preditoras)", xgb))
+aux$CRy_Ry <- aux$r / r_conv
+base <- g(N_conv, r_conv, L_conv)
+aux$so_ciclo_curto     <- 100 * g(N_conv, aux$r, L_htp)  / base
+aux$mais_genotipos     <- 100 * g(N_htp,  aux$r, L_conv) / base
+aux$genotipos_e_ciclo  <- 100 * g(N_htp,  aux$r, L_htp)  / base
+cbind(criterio = aux$criterio, round(aux[-1], 2))
+```
+
+O rendimento medido (convencional) tem H² = `r round(H2_conv, 2)`, r = `r round(r_conv, 2)`; ganho relativo = 100 por definição. As três últimas colunas são o ganho anual relativo, como nos cenários da seção 9.
+
+```{r aux_grafico, fig.height = 3.6}
+ggplot(aux, aes(reorder(criterio, r), r)) + geom_col(fill = "#1b5e20", width = 0.6) + coord_flip() +
+  geom_hline(yintercept = r_conv, linetype = 2) + labs(x = NULL, y = "acurácia r (tracejado: rendimento medido)") + tema
+```
+
+Leitura: os modelos de predição têm H² alta (são repetíveis), mas rG baixa, e por isso o r fica abaixo do índice simples. Os índices (razões entre bandas) já cancelam a variação de brilho entre voos, o que um modelo treinado em bandas cruas só aprende com muitos genótipos. Com poucos genótipos de treino e rendimento de parcela com muito ruído, a predição soma erro de estimação ao critério. Com dados reais, o resultado pode ser outro; a comparação deve ser feita com validação por genótipo, como acima.
+
+```{r salvar, include=FALSE}
+write.xlsx(list(r_convencional = data.frame(H2 = H2_conv, r = r_conv), r_htp = data.frame(situacao = rownames(htp), htp), por_voo = voos,
+                tempo = tempo, cenarios = res, auxiliar = aux), "equacao_melhorista_resultados.xlsx")
+```
+
+## Referências
+
+COBB, J. N. et al. Enhancing the rate of genetic gain in public-sector plant breeding programs: lessons from the breeder's equation. Theoretical and Applied Genetics, v. 132, n. 3, p. 627-645, 2019.
+
+CRUZ, C. D.; REGAZZI, A. J.; CARNEIRO, P. C. S. Modelos biométricos aplicados ao melhoramento genético. 4. ed. Viçosa, MG: UFV, 2012. v. 1.
+
+FALCONER, D. S.; MACKAY, T. F. C. Introduction to quantitative genetics. 4. ed. Harlow: Longman, 1996.
+
+FRITSCHE-NETO, R. et al. Prediction-based breeding: modern tools to optimize and reshape programs. Crop Science, v. 65, n. 5, art. e70175, 2025.
+
+LUSH, J. L. Animal breeding plans. Ames: Iowa State College Press, 1937.
+
+ROBERTS, D. R. et al. Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. Ecography, v. 40, n. 8, p. 913-929, 2017.
